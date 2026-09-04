@@ -28,6 +28,20 @@ final class SquirrelInputController: IMKInputController {
   private var chordDuration: TimeInterval = 0
   private var currentApp: String = ""
 
+  // State preservation for dynamic candidate stream mutations
+  struct CandidatePanelSnapshot {
+    var preedit: String = ""
+    var selRange: NSRange = .empty
+    var caretPos: Int = 0
+    var candidates: [String] = []
+    var comments: [String] = []
+    var labels: [String] = []
+    var highlighted: Int = 0
+    var page: Int = 0
+    var lastPage: Bool = false
+  }
+  var lastPanelSnapshot = CandidatePanelSnapshot()
+
   // swiftlint:disable:next cyclomatic_complexity
   override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
     guard let event = event else { return false }
@@ -550,17 +564,65 @@ private extension SquirrelInputController {
       let lastPage = ctx.menu.is_last_page
 
       let selRange = NSRange(location: start.utf16Offset(in: preedit), length: preedit.utf16.distance(from: start, to: end))
-      showPanel(preedit: inlinePreedit ? "" : preedit, selRange: selRange, caretPos: caretPos.utf16Offset(in: preedit),
-                candidates: candidates, comments: comments, labels: labels, highlighted: Int(ctx.menu.highlighted_candidate_index),
+      let panelPreedit = inlinePreedit ? "" : preedit
+      let panelCaretPos = caretPos.utf16Offset(in: preedit)
+      let highlightedIdx = Int(ctx.menu.highlighted_candidate_index)
+
+      // Retain latest snapshot for dynamic stream mutations
+      lastPanelSnapshot = CandidatePanelSnapshot(
+        preedit: panelPreedit,
+        selRange: selRange,
+        caretPos: panelCaretPos,
+        candidates: candidates,
+        comments: comments,
+        labels: labels,
+        highlighted: highlightedIdx,
+        page: page,
+        lastPage: lastPage
+      )
+      CandidateStreamBridge.shared.attach(controller: self)
+
+      // Render native candidate panel immediately (0ms latency)
+      showPanel(preedit: panelPreedit, selRange: selRange, caretPos: panelCaretPos,
+                candidates: candidates, comments: comments, labels: labels, highlighted: highlightedIdx,
                 page: page, lastPage: lastPage)
+
       _ = rimeAPI.free_context(&ctx)
     } else {
+      CandidateStreamBridge.shared.reset()
       hidePalettes()
+    }
+  }
+
+  func refreshPanelWithCurrentSnapshot() {
+    guard let client = client, !lastPanelSnapshot.candidates.isEmpty else { return }
+    var inputPos = NSRect()
+    client.attributes(forCharacterIndex: 0, lineHeightRectangle: &inputPos)
+    if let panel = NSApp.squirrelAppDelegate.panel {
+      panel.position = inputPos
+      panel.inputController = self
+      panel.update(preedit: lastPanelSnapshot.preedit,
+                   selRange: lastPanelSnapshot.selRange,
+                   caretPos: lastPanelSnapshot.caretPos,
+                   candidates: lastPanelSnapshot.candidates,
+                   comments: lastPanelSnapshot.comments,
+                   labels: lastPanelSnapshot.labels,
+                   highlighted: lastPanelSnapshot.highlighted,
+                   page: lastPanelSnapshot.page,
+                   lastPage: lastPanelSnapshot.lastPage,
+                   update: true)
     }
   }
 
   func commit(string: String) {
     guard let client = client else { return }
+
+    // Intercept committed text if an external stream mutation registered an override
+    var commitString = string
+    if let overridden = CandidateStreamBridge.shared.consumeCommitOverride(for: string) {
+      commitString = overridden
+    }
+    CandidateStreamBridge.shared.reset()
 
     let forceMarkedText =
       session != 0 &&
@@ -569,8 +631,8 @@ private extension SquirrelInputController {
     // Direct commits such as full-width punctuation do not necessarily have an
     // active marked-text phase. Some NSTextInputClient implementations require
     // one before accepting insertText.
-    if forceMarkedText && preedit.isEmpty && !string.isEmpty {
-      let markedText = NSMutableAttributedString(string: string)
+    if forceMarkedText && preedit.isEmpty && !commitString.isEmpty {
+      let markedText = NSMutableAttributedString(string: commitString)
       client.setMarkedText(
         markedText,
         selectionRange: NSRange(location: markedText.length, length: 0),
@@ -578,7 +640,7 @@ private extension SquirrelInputController {
       )
     }
 
-    client.insertText(string, replacementRange: .empty)
+    client.insertText(commitString, replacementRange: .empty)
     preedit = ""
     hidePalettes()
   }
@@ -640,3 +702,96 @@ private extension SquirrelInputController {
   }
 
 }
+
+// MARK: - CandidateStreamBridge (Generic Streaming Mutation Receiver for Backend Extensions)
+
+public struct CandidateMutationPayload: Codable {
+  public var index: Int?
+  public var text: String?
+  public var comment: String?
+  public var commitText: String?
+  public var comments: [String]?
+  public var candidates: [String]?
+}
+
+final class CandidateStreamBridge {
+  static let shared = CandidateStreamBridge()
+
+  private weak var currentController: SquirrelInputController?
+  private var commitOverrides: [String: String] = [:]
+
+  private init() {
+    setupNotificationObserver()
+  }
+
+  func attach(controller: SquirrelInputController) {
+    self.currentController = controller
+  }
+
+  func reset() {
+    commitOverrides.removeAll()
+  }
+
+  func consumeCommitOverride(for text: String) -> String? {
+    let override = commitOverrides[text]
+    commitOverrides.removeValue(forKey: text)
+    return override
+  }
+
+  private func setupNotificationObserver() {
+    DistributedNotificationCenter.default().addObserver(
+      self,
+      selector: #selector(handleMutationNotification(_:)),
+      name: .init("SquirrelCandidateStreamMutation"),
+      object: nil
+    )
+  }
+
+  @objc private func handleMutationNotification(_ notification: Notification) {
+    guard let jsonString = notification.object as? String,
+          let data = jsonString.data(using: .utf8),
+          let payload = try? JSONDecoder().decode(CandidateMutationPayload.self, from: data) else {
+      return
+    }
+
+    DispatchQueue.main.async { [weak self] in
+      self?.applyMutation(payload)
+    }
+  }
+
+  private func applyMutation(_ payload: CandidateMutationPayload) {
+    guard let controller = currentController else { return }
+
+    if let commit = payload.commitText {
+      if let index = payload.index, index >= 0, index < controller.lastPanelSnapshot.candidates.count {
+        let key = controller.lastPanelSnapshot.candidates[index]
+        commitOverrides[key] = commit
+      } else if let text = payload.text {
+        commitOverrides[text] = commit
+      }
+    }
+
+    if let allCandidates = payload.candidates {
+      controller.lastPanelSnapshot.candidates = allCandidates
+    }
+
+    if let allComments = payload.comments {
+      controller.lastPanelSnapshot.comments = allComments
+    }
+
+    if let index = payload.index, index >= 0, index < controller.lastPanelSnapshot.candidates.count {
+      if let text = payload.text {
+        controller.lastPanelSnapshot.candidates[index] = text
+      }
+      if let comment = payload.comment {
+        while controller.lastPanelSnapshot.comments.count <= index {
+          controller.lastPanelSnapshot.comments.append("")
+        }
+        controller.lastPanelSnapshot.comments[index] = comment
+      }
+    }
+
+    controller.refreshPanelWithCurrentSnapshot()
+  }
+}
+
