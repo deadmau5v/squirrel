@@ -595,7 +595,17 @@ private extension SquirrelInputController {
   }
 
   func refreshPanelWithCurrentSnapshot() {
-    guard let client = client, !lastPanelSnapshot.candidates.isEmpty else { return }
+    guard let client = client else { return }
+    let candidates = lastPanelSnapshot.candidates
+    var comments = lastPanelSnapshot.comments
+    guard !candidates.isEmpty else { return }
+
+    // Boundary check: ensure comments length strictly covers all candidates
+    if comments.count < candidates.count {
+      comments.append(contentsOf: repeatElement("", count: candidates.count - comments.count))
+    }
+    lastPanelSnapshot.comments = comments
+
     var inputPos = NSRect()
     client.attributes(forCharacterIndex: 0, lineHeightRectangle: &inputPos)
     if let panel = NSApp.squirrelAppDelegate.panel {
@@ -604,8 +614,8 @@ private extension SquirrelInputController {
       panel.update(preedit: lastPanelSnapshot.preedit,
                    selRange: lastPanelSnapshot.selRange,
                    caretPos: lastPanelSnapshot.caretPos,
-                   candidates: lastPanelSnapshot.candidates,
-                   comments: lastPanelSnapshot.comments,
+                   candidates: candidates,
+                   comments: comments,
                    labels: lastPanelSnapshot.labels,
                    highlighted: lastPanelSnapshot.highlighted,
                    page: lastPanelSnapshot.page,
@@ -761,9 +771,11 @@ final class CandidateStreamBridge {
 
   private func applyMutation(_ payload: CandidateMutationPayload) {
     guard let controller = currentController else { return }
+    let candidateCount = controller.lastPanelSnapshot.candidates.count
+    guard candidateCount > 0 else { return }
 
     if let commit = payload.commitText {
-      if let index = payload.index, index >= 0, index < controller.lastPanelSnapshot.candidates.count {
+      if let index = payload.index, index >= 0, index < candidateCount {
         let key = controller.lastPanelSnapshot.candidates[index]
         commitOverrides[key] = commit
       } else if let text = payload.text {
@@ -771,20 +783,26 @@ final class CandidateStreamBridge {
       }
     }
 
-    if let allCandidates = payload.candidates {
+    if let allCandidates = payload.candidates, !allCandidates.isEmpty {
       controller.lastPanelSnapshot.candidates = allCandidates
     }
 
     if let allComments = payload.comments {
-      controller.lastPanelSnapshot.comments = allComments
+      var safeComments = allComments
+      if safeComments.count < candidateCount {
+        safeComments.append(contentsOf: repeatElement("", count: candidateCount - safeComments.count))
+      } else if safeComments.count > candidateCount {
+        safeComments = Array(safeComments.prefix(candidateCount))
+      }
+      controller.lastPanelSnapshot.comments = safeComments
     }
 
-    if let index = payload.index, index >= 0, index < controller.lastPanelSnapshot.candidates.count {
+    if let index = payload.index, index >= 0, index < candidateCount {
       if let text = payload.text {
         controller.lastPanelSnapshot.candidates[index] = text
       }
       if let comment = payload.comment {
-        while controller.lastPanelSnapshot.comments.count <= index {
+        while controller.lastPanelSnapshot.comments.count < candidateCount {
           controller.lastPanelSnapshot.comments.append("")
         }
         controller.lastPanelSnapshot.comments[index] = comment
