@@ -79,12 +79,15 @@ final class SquirrelInstaller {
     for (mode, inputSource) in getInputSource(modes: [modeToSelect]) {
       if let enabled = getBool(for: inputSource, key: kTISPropertyInputSourceIsEnabled),
          let selectable = getBool(for: inputSource, key: kTISPropertyInputSourceIsSelectCapable),
-         let selected = getBool(for: inputSource, key: kTISPropertyInputSourceIsSelected),
-         enabled && selectable && !selected {
-        let error = TISSelectInputSource(inputSource)
-        print("Selection \(error == noErr ? "succeeds" : "fails") for input source: \(mode.rawValue)")
-      } else {
-        print("Failed to select \(mode.rawValue)")
+         let selected = getBool(for: inputSource, key: kTISPropertyInputSourceIsSelected) {
+        if selected {
+          print("Input source already selected: \(mode.rawValue)")
+        } else if enabled && selectable {
+          let error = TISSelectInputSource(inputSource)
+          print("Selection \(error == noErr ? "succeeds" : "fails") for input source: \(mode.rawValue)")
+        } else {
+          print("Failed to select \(mode.rawValue)")
+        }
       }
     }
   }
